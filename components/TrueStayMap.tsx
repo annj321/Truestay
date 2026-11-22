@@ -7,89 +7,22 @@ import '@geoman-io/leaflet-geoman-free';
 import '@geoman-io/leaflet-geoman-free/dist/leaflet-geoman.css';
 import * as turf from '@turf/turf';
 
-interface Hotel {
-  id: string;
-  name: string;
-  address: string;
-  lat: number;
-  lng: number;
-  parking?: string;
-  picture?: string;
-}
-
-interface FavoriteHotel extends Hotel {
-  note: string;
-  savedAt: number;
-}
-
-// 【方法 3 預留接口】未來匯入政府捷運/台鐵車站 JSON 用的資料結構
-interface LocalStation {
-  id: string;
-  name: string;
-  type: 'MRT' | 'TRA' | 'LRT';
-  lat: number;
-  lng: number;
-}
-
-interface TargetLocation {
-  lat: number;
-  lng: number;
-  name: string;
-}
-
-interface SearchCandidate {
-  id: string;
-  name: string;
-  displayName: string;
-  lat: number;
-  lng: number;
-  source: 'station' | 'osm' | 'hotel';
-  hotelData?: Hotel;
-}
+import {
+  FavoriteHotel,
+  Hotel,
+  LocalStation,
+  SearchCandidate,
+  TargetLocation,
+} from '../types/truestay';
+import {
+  formatDistance,
+  normalizeSearchKeyword,
+  reverseGeocode,
+} from '../utils/geo';
+import TopSearchBar from './TopSearchBar';
+import HotelSidebar from './HotelSidebar';
 
 const FAVORITES_STORAGE_KEY = 'truestay_favorites_v1';
-
-// 【方法 1】台灣常見地標說法自動校正（對齊 OpenStreetMap 命名習慣）
-function normalizeSearchKeyword(raw: string): string {
-  let q = raw.trim();
-  if (/^(.+)捷運站$/.test(q) && !q.startsWith('捷運')) {
-    q = q.replace(/^(.+)捷運站$/, '捷運$1站');
-  }
-  if (/^(.+)火車站$/.test(q)) {
-    q = q.replace(/^(.+)火車站$/, '$1車站');
-  }
-  return q;
-}
-
-// 格式化距離顯示
-function formatDistance(meters: number): string {
-  return meters < 1000
-    ? `${Math.round(meters)} 公尺`
-    : `${(meters / 1000).toFixed(2)} 公里`;
-}
-
-// 反向地理編碼：透過經緯度反查該處的真實地名或路名
-async function reverseGeocode(lat: number, lng: number): Promise<string> {
-  try {
-    const res = await fetch(
-      `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1&accept-language=zh-TW`
-    );
-    const data = await res.json();
-    if (data?.name) return data.name;
-    const addr = data?.address;
-    if (addr) {
-      const road = addr.road || addr.pedestrian || addr.neighbourhood || addr.suburb;
-      const house = addr.house_number ? `${addr.house_number}號` : '';
-      if (road) return `${road}${house}`;
-    }
-    if (data?.display_name) {
-      return data.display_name.split(',')[0];
-    }
-    return '自訂地標';
-  } catch {
-    return '自訂地標';
-  }
-}
 
 export default function TrueStayMap() {
   const mapContainerRef = useRef<HTMLDivElement>(null);
@@ -102,7 +35,7 @@ export default function TrueStayMap() {
   const activeHotelMarkerRef = useRef<L.Marker | null>(null);
   const distanceLineRef = useRef<L.Polyline | null>(null);
   const activeHotelRef = useRef<Hotel | null>(null);
-  const targetLocationRef = useRef<TargetLocation | null>(null); // 確保點擊地圖藍點時永遠讀到最新地標
+  const targetLocationRef = useRef<TargetLocation | null>(null);
   const isPlacingPinRef = useRef(false);
 
   const [status, setStatus] = useState('正在載入全台旅宿資料...');
@@ -119,7 +52,6 @@ export default function TrueStayMap() {
   const [activeHotelId, setActiveHotelId] = useState<string | null>(null);
   const [activeDistance, setActiveDistance] = useState<string | null>(null);
 
-  // 同步更新地標 state 與 ref
   function updateTargetLocation(next: TargetLocation | null) {
     targetLocationRef.current = next;
     setTargetLocation(next);
@@ -129,9 +61,7 @@ export default function TrueStayMap() {
   useEffect(() => {
     try {
       const saved = localStorage.getItem(FAVORITES_STORAGE_KEY);
-      if (saved) {
-        setFavorites(JSON.parse(saved));
-      }
+      if (saved) setFavorites(JSON.parse(saved));
     } catch (err) {
       console.error('讀取收藏清單失敗', err);
     }
@@ -152,20 +82,14 @@ export default function TrueStayMap() {
     if (exists) {
       persistFavorites(favorites.filter((f) => f.id !== hotel.id));
     } else {
-      const newFav: FavoriteHotel = {
-        ...hotel,
-        note: '',
-        savedAt: Date.now(),
-      };
-      persistFavorites([newFav, ...favorites]);
+      persistFavorites([{ ...hotel, note: '', savedAt: Date.now() }, ...favorites]);
     }
   }
 
   function updateFavoriteNote(hotelId: string, note: string) {
-    const next = favorites.map((f) =>
-      f.id === hotelId ? { ...f, note } : f
+    persistFavorites(
+      favorites.map((f) => (f.id === hotelId ? { ...f, note } : f))
     );
-    persistFavorites(next);
   }
 
   useEffect(() => {
@@ -221,7 +145,6 @@ export default function TrueStayMap() {
     loadHotels();
   }, []);
 
-  // 共用工具：清除地圖上所有已畫的多邊形與框選結果
   function clearDrawnSelection() {
     if (currentPolygonLayerRef.current) {
       currentPolygonLayerRef.current.remove();
@@ -242,7 +165,6 @@ export default function TrueStayMap() {
     setActiveDistance(null);
   }
 
-  // 共用工具：在地圖上畫一顆可點擊的藍色飯店點（點擊後與右側清單完全連動）
   function addHotelBlueMarker(hotel: Hotel) {
     if (!markersLayerRef.current) return;
 
@@ -254,22 +176,19 @@ export default function TrueStayMap() {
       fillOpacity: 0.9,
     });
 
-    // 滑鼠移過顯示名稱，點擊直接觸發選中與距離計算
     dot.bindTooltip(hotel.name, { direction: 'top', offset: [0, -8] });
     dot.on('click', (e) => {
-      L.DomEvent.stopPropagation(e); // 避免同時觸發地圖的「手動放地標」點擊事件
+      L.DomEvent.stopPropagation(e);
       handleSelectHotel(hotel, true);
     });
 
     dot.addTo(markersLayerRef.current);
   }
 
-  // 共用工具：根據框選的多邊形圖層篩選飯店，並自動切換空框/有結果樣式
   function evaluatePolygonLayer(layer: any) {
     const rawGeo = layer.toGeoJSON();
     const polygonFeature =
       rawGeo.type === 'FeatureCollection' ? rawGeo.features[0] : rawGeo;
-
     if (!polygonFeature) return;
 
     const inside = allHotelsRef.current.filter((h) =>
@@ -277,23 +196,23 @@ export default function TrueStayMap() {
     );
 
     if (typeof layer.setStyle === 'function') {
-      if (inside.length === 0) {
-        layer.setStyle({
-          color: '#ef4444',
-          fillColor: '#ef4444',
-          fillOpacity: 0.12,
-          dashArray: '6, 6',
-          weight: 2,
-        });
-      } else {
-        layer.setStyle({
-          color: '#2563eb',
-          fillColor: '#3b82f6',
-          fillOpacity: 0.15,
-          dashArray: '',
-          weight: 2,
-        });
-      }
+      layer.setStyle(
+        inside.length === 0
+          ? {
+              color: '#ef4444',
+              fillColor: '#ef4444',
+              fillOpacity: 0.12,
+              dashArray: '6, 6',
+              weight: 2,
+            }
+          : {
+              color: '#2563eb',
+              fillColor: '#3b82f6',
+              fillOpacity: 0.15,
+              dashArray: '',
+              weight: 2,
+            }
+      );
     }
 
     setSelectedHotels(inside);
@@ -315,7 +234,6 @@ export default function TrueStayMap() {
     );
   }
 
-  // 一鍵往外擴大目前框選範圍 500 公尺
   function handleExpandPolygon() {
     if (!currentPolygonLayerRef.current || !mapRef.current) return;
 
@@ -336,7 +254,6 @@ export default function TrueStayMap() {
     evaluatePolygonLayer(expandedLayer);
   }
 
-  // 共用工具：重繪「目標地標 <-> 選中飯店」的虛線、距離與綠色標誌
   function renderActiveHotelVisuals(hotel: Hotel, target: TargetLocation | null) {
     if (!mapRef.current) return;
 
@@ -401,7 +318,6 @@ export default function TrueStayMap() {
       .openTooltip();
   }
 
-  // 共用工具：插上「可自由拖曳」的紅色目的地標誌
   function focusTargetLocation(
     lat: number,
     lng: number,
@@ -552,7 +468,7 @@ export default function TrueStayMap() {
     };
   }, []);
 
-  // 3. 綜合搜尋：專心找全台車站、地標與旅宿
+  // 3. 綜合搜尋
   async function handleSearch(e: React.FormEvent) {
     e.preventDefault();
     const keyword = searchQuery.trim();
@@ -633,7 +549,6 @@ export default function TrueStayMap() {
   function handleSelectCandidate(candidate: SearchCandidate) {
     setSearchCandidates([]);
     setSearchQuery(candidate.name);
-
     clearDrawnSelection();
 
     if (candidate.source === 'hotel' && candidate.hotelData) {
@@ -668,7 +583,6 @@ export default function TrueStayMap() {
     setStatus(`已在右側列出全部 ${allMatchedHotels.length} 間符合「${searchQuery}」的旅宿`);
   }
 
-  // 4. 點選飯店（不論從右側清單或直接點地圖藍點，都會走這裡）
   function handleSelectHotel(hotel: Hotel, fromMap = false) {
     if (!mapRef.current) return;
 
@@ -677,14 +591,12 @@ export default function TrueStayMap() {
     renderActiveHotelVisuals(hotel, targetLocationRef.current);
 
     if (fromMap) {
-      // 從地圖點藍點時：切換回框選結果分頁，並自動捲動右側清單到該飯店卡片
       setActiveTab('results');
       setTimeout(() => {
         document
           .getElementById(`hotel-card-${hotel.id}`)
           ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       }, 50);
-      // 保持目前縮放等級平滑移動過去（若原本縮太小才稍微放大到 16）
       const targetZoom = Math.max(mapRef.current.getZoom(), 16);
       mapRef.current.setView([hotel.lat, hotel.lng], targetZoom);
     } else {
@@ -694,272 +606,48 @@ export default function TrueStayMap() {
 
   return (
     <div className="flex h-screen w-screen flex-col">
-      {/* 頂部搜尋列 */}
-      <div className="relative z-[1100] flex flex-wrap items-center justify-between gap-3 bg-slate-900 px-4 py-3 text-white">
-        <div className="font-bold text-lg">TrueStay 地圖驗證版</div>
+      <TopSearchBar
+        searchQuery={searchQuery}
+        onSearchQueryChange={(val) => {
+          setSearchQuery(val);
+          if (searchCandidates.length > 0) setSearchCandidates([]);
+        }}
+        onSearch={handleSearch}
+        isSearching={isSearching}
+        isPlacingPin={isPlacingPin}
+        onTogglePlacingPin={() => {
+          setIsPlacingPin((prev) => !prev);
+          setStatus(
+            !isPlacingPin
+              ? '請直接點擊地圖上的任意位置來放置地標'
+              : '已取消手動放置地標'
+          );
+        }}
+        searchCandidates={searchCandidates}
+        onSelectCandidate={handleSelectCandidate}
+        allMatchedHotels={allMatchedHotels}
+        onShowAllMatchedHotels={handleShowAllMatchedHotels}
+        status={status}
+      />
 
-        {/* 搜尋框 + 手動放地標按鈕 */}
-        <div className="relative flex items-center gap-2">
-          <form onSubmit={handleSearch} className="flex gap-2">
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => {
-                setSearchQuery(e.target.value);
-                if (searchCandidates.length > 0) setSearchCandidates([]);
-              }}
-              placeholder="輸入地標或飯店名稱（如：巨蛋、西門捷運站）"
-              className="w-72 rounded bg-white px-3 py-1.5 text-sm text-black"
-            />
-            <button
-              type="submit"
-              disabled={isSearching}
-              className="rounded bg-blue-600 px-4 py-1.5 text-sm font-medium hover:bg-blue-500 disabled:bg-blue-800"
-            >
-              {isSearching ? '搜尋中...' : '搜尋'}
-            </button>
-          </form>
-
-          {/* 手動放地標切換按鈕 */}
-          <button
-            type="button"
-            onClick={() => {
-              setIsPlacingPin((prev) => !prev);
-              setStatus(
-                !isPlacingPin
-                  ? '請直接點擊地圖上的任意位置來放置地標'
-                  : '已取消手動放置地標'
-              );
-            }}
-            className={`rounded px-3 py-1.5 text-sm font-medium transition ${
-              isPlacingPin
-                ? 'bg-rose-600 text-white ring-2 ring-rose-300'
-                : 'bg-slate-700 text-slate-100 hover:bg-slate-600'
-            }`}
-          >
-            {isPlacingPin ? '🎯 請點地圖放置（取消）' : '📍 手動放地標'}
-          </button>
-
-          {/* 綜合下拉選單 */}
-          {searchCandidates.length > 0 && (
-            <div className="absolute left-0 top-full mt-1 w-96 overflow-hidden rounded-md border border-slate-200 bg-white text-slate-800 shadow-lg">
-              <ul className="max-h-72 overflow-y-auto">
-                {searchCandidates.map((c) => (
-                  <li
-                    key={c.id}
-                    onClick={() => handleSelectCandidate(c)}
-                    className="cursor-pointer border-b border-slate-100 px-3 py-2 text-xs last:border-b-0 hover:bg-blue-50"
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="font-semibold text-slate-900">
-                        {c.source === 'station' && '🚇 '}
-                        {c.source === 'osm' && '📍 '}
-                        {c.source === 'hotel' && '🏨 '}
-                        {c.name}
-                      </span>
-                      <span
-                        className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                          c.source === 'hotel'
-                            ? 'bg-emerald-100 text-emerald-700'
-                            : 'bg-blue-100 text-blue-700'
-                        }`}
-                      >
-                        {c.source === 'station' && '車站'}
-                        {c.source === 'osm' && '地標'}
-                        {c.source === 'hotel' && '旅宿'}
-                      </span>
-                    </div>
-                    <div className="mt-0.5 line-clamp-1 text-slate-500">
-                      {c.displayName}
-                    </div>
-                  </li>
-                ))}
-              </ul>
-
-              {allMatchedHotels.length > 1 && (
-                <button
-                  type="button"
-                  onClick={handleShowAllMatchedHotels}
-                  className="w-full border-t border-slate-200 bg-emerald-50 px-3 py-2 text-center text-xs font-semibold text-emerald-700 hover:bg-emerald-100"
-                >
-                  🏨 查看全部 {allMatchedHotels.length} 間相符旅宿 ➔
-                </button>
-              )}
-            </div>
-          )}
-        </div>
-
-        <div className="text-xs text-slate-300">{status}</div>
-      </div>
-
-      {/* 主畫面：左地圖、右雙分頁清單 */}
       <div className="flex flex-1 overflow-hidden">
         <div ref={mapContainerRef} className="h-full flex-1" />
 
-        <div className="flex w-80 flex-col border-l bg-white text-slate-800">
-          {/* 分頁切換列 */}
-          <div className="flex border-b bg-slate-50 text-sm font-semibold">
-            <button
-              type="button"
-              onClick={() => setActiveTab('results')}
-              className={`flex-1 py-2.5 text-center transition ${
-                activeTab === 'results'
-                  ? 'border-b-2 border-blue-600 bg-white text-blue-600'
-                  : 'text-slate-500 hover:text-slate-800'
-              }`}
-            >
-              🔍 框選結果 ({selectedHotels.length})
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveTab('favorites')}
-              className={`flex-1 py-2.5 text-center transition ${
-                activeTab === 'favorites'
-                  ? 'border-b-2 border-rose-500 bg-white text-rose-600'
-                  : 'text-slate-500 hover:text-slate-800'
-              }`}
-            >
-              ❤️ 收藏清單 ({favorites.length})
-            </button>
-          </div>
-
-          {/* 分頁內容區 */}
-          <div className="flex-1 overflow-y-auto p-4">
-            {activeTab === 'results' ? (
-              selectedHotels.length === 0 ? (
-                hasDrawnArea ? (
-                  <div className="rounded-lg border border-rose-200 bg-rose-50 p-4 text-center">
-                    <div className="text-sm font-semibold text-rose-700">
-                      這個範圍內目前沒有合法旅宿
-                    </div>
-                    <p className="mt-1.5 text-xs text-rose-600/90">
-                      你可以往外擴大目前範圍，或直接在地圖上重畫一個新框（會自動取代舊框）。
-                    </p>
-                    <div className="mt-3 flex flex-col gap-2">
-                      <button
-                        type="button"
-                        onClick={handleExpandPolygon}
-                        className="w-full rounded bg-blue-600 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-500"
-                      >
-                        🔍 往外擴大 500 公尺重找
-                      </button>
-                      <button
-                        type="button"
-                        onClick={clearDrawnSelection}
-                        className="w-full rounded border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
-                      >
-                        清除目前框選
-                      </button>
-                    </div>
-                  </div>
-                ) : (
-                  <p className="text-sm text-slate-500">
-                    請先搜尋地標或點上方「📍 手動放地標」，再點地圖左上角的「多邊形」或「矩形」圖示框選想住的區域。
-                  </p>
-                )
-              ) : (
-                <ul className="space-y-3">
-                  {selectedHotels.map((h) => {
-                    const isSelected = activeHotelId === h.id;
-                    const isFav = favorites.some((f) => f.id === h.id);
-                    return (
-                      <li
-                        key={h.id}
-                        id={`hotel-card-${h.id}`}
-                        onClick={() => handleSelectHotel(h)}
-                        className={`cursor-pointer rounded border p-3 transition ${
-                          isSelected
-                            ? 'border-emerald-500 bg-emerald-50 ring-1 ring-emerald-500'
-                            : 'hover:bg-blue-50'
-                        }`}
-                      >
-                        <div className="flex items-start justify-between gap-2">
-                          <div className="font-semibold text-sm">{h.name}</div>
-                          <button
-                            type="button"
-                            onClick={(e) => toggleFavorite(h, e)}
-                            title={isFav ? '移除收藏' : '加入收藏'}
-                            className="shrink-0 text-base leading-none hover:scale-110 transition"
-                          >
-                            {isFav ? '❤️' : '🤍'}
-                          </button>
-                        </div>
-                        <div className="mt-1 text-xs text-slate-500">{h.address}</div>
-                        {h.parking && (
-                          <div className="mt-1 text-xs text-emerald-700">
-                            🅿️ {h.parking}
-                          </div>
-                        )}
-                        {isSelected && activeDistance && targetLocation && (
-                          <div className="mt-2 inline-block rounded bg-emerald-600 px-2 py-0.5 text-xs font-medium text-white">
-                            📏 距「{targetLocation.name}」約 {activeDistance}
-                          </div>
-                        )}
-                      </li>
-                    );
-                  })}
-                </ul>
-              )
-            ) : favorites.length === 0 ? (
-              <p className="text-sm text-slate-500">
-                目前還沒有收藏任何飯店。點擊飯店卡片右上角的 🤍 即可加入收藏，並記錄個人優缺點筆記！
-              </p>
-            ) : (
-              <ul className="space-y-3">
-                {favorites.map((h) => {
-                  const isSelected = activeHotelId === h.id;
-                  return (
-                    <li
-                      key={h.id}
-                      onClick={() => handleSelectHotel(h)}
-                      className={`cursor-pointer rounded border p-3 transition ${
-                        isSelected
-                          ? 'border-rose-400 bg-rose-50/60 ring-1 ring-rose-400'
-                          : 'hover:bg-slate-50'
-                      }`}
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="font-semibold text-sm">{h.name}</div>
-                        <button
-                          type="button"
-                          onClick={(e) => toggleFavorite(h, e)}
-                          title="移除收藏"
-                          className="shrink-0 text-base leading-none hover:scale-110 transition"
-                        >
-                          ❤️
-                        </button>
-                      </div>
-                      <div className="mt-1 text-xs text-slate-500">{h.address}</div>
-                      {h.parking && (
-                        <div className="mt-1 text-xs text-emerald-700">
-                          🅿️ {h.parking}
-                        </div>
-                      )}
-                      {isSelected && activeDistance && targetLocation && (
-                        <div className="mt-2 inline-block rounded bg-emerald-600 px-2 py-0.5 text-xs font-medium text-white">
-                          📏 距「{targetLocation.name}」約 {activeDistance}
-                        </div>
-                      )}
-
-                      <div
-                        className="mt-2.5"
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        <textarea
-                          value={h.note}
-                          onChange={(e) => updateFavoriteNote(h.id, e.target.value)}
-                          placeholder="記錄優點、房價或備註（自動存檔）..."
-                          rows={2}
-                          className="w-full resize-none rounded border border-slate-200 bg-white p-2 text-xs text-slate-700 placeholder:text-slate-400 focus:border-rose-400 focus:outline-none"
-                        />
-                      </div>
-                    </li>
-                  );
-                })}
-              </ul>
-            )}
-          </div>
-        </div>
+        <HotelSidebar
+          activeTab={activeTab}
+          onTabChange={setActiveTab}
+          selectedHotels={selectedHotels}
+          hasDrawnArea={hasDrawnArea}
+          favorites={favorites}
+          activeHotelId={activeHotelId}
+          activeDistance={activeDistance}
+          targetLocation={targetLocation}
+          onSelectHotel={(hotel) => handleSelectHotel(hotel, false)}
+          onToggleFavorite={toggleFavorite}
+          onUpdateFavoriteNote={updateFavoriteNote}
+          onExpandPolygon={handleExpandPolygon}
+          onClearDrawnSelection={clearDrawnSelection}
+        />
       </div>
     </div>
   );
